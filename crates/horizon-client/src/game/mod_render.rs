@@ -16,6 +16,10 @@ use {
 #[derive(Default)]
 pub(super) struct Shake {
     jolts: Vec<Jolt>,
+    /// When the noise started: a clock of its own, so a mod that adds a
+    /// jolt every tick (a rumble at speed) gets one smooth noise rather
+    /// than one restarted with each jolt.
+    epoch: Option<Instant>,
 }
 
 #[cfg(feature = "mods")]
@@ -39,6 +43,7 @@ const SHAKE_DEGREES: (f32, f32) = (3.0, 2.0);
 #[cfg(feature = "mods")]
 impl Shake {
     pub(super) fn add(&mut self, strength: f32, seconds: f32) {
+        self.epoch.get_or_insert_with(Instant::now);
         self.jolts.push(Jolt {
             start: Instant::now(),
             strength,
@@ -50,6 +55,9 @@ impl Shake {
     fn offset(&mut self, now: Instant, scale: f32) -> (f32, f32) {
         self.jolts
             .retain(|j| now.duration_since(j.start).as_secs_f32() < j.seconds);
+        if self.jolts.is_empty() {
+            self.epoch = None;
+        }
         let mut strength = 0.0;
         for j in &self.jolts {
             let left = 1.0 - now.duration_since(j.start).as_secs_f32() / j.seconds;
@@ -61,9 +69,8 @@ impl Shake {
         }
         // Smooth noise: sines at unrelated rates, so it never repeats visibly.
         let t = self
-            .jolts
-            .first()
-            .map_or(0.0, |j| now.duration_since(j.start).as_secs_f32());
+            .epoch
+            .map_or(0.0, |e| now.duration_since(e).as_secs_f32());
         let wave = |a: f32, b: f32, c: f32| {
             ((t * a).sin() * 0.5 + (t * b).sin() * 0.3 + (t * c).sin() * 0.2).clamp(-1.0, 1.0)
         };

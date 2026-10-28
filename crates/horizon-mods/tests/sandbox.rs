@@ -241,8 +241,8 @@ id = "too_new"
 name = "Too New"
 version = "0.1.0"
 api = "0.1"
-capabilities = ["game-read", "chat", "hud", "storage", "command", "ui", "render", "input", "recipes"]
-experimental = ["ui", "render", "input", "recipes"]
+capabilities = ["game-read", "chat", "hud", "storage", "command", "ui", "render", "input", "recipes", "motion"]
+experimental = ["ui", "render", "input", "recipes", "motion"]
 "#;
     std::fs::write(dir.join("horizon-mod.toml"), manifest).unwrap();
     std::fs::write(dir.join("mod.wasm"), wasm).unwrap();
@@ -256,7 +256,11 @@ experimental = ["ui", "render", "input", "recipes"]
     };
     assert_eq!(level("coords_hud.hmod"), 0);
     // The UI guest draws far terrain (`render.set-far-terrain`).
-    assert_eq!(level("horizon_mods_test_ui_guest.hmod"), LEVEL);
+    assert_eq!(
+        Some(level("horizon_mods_test_ui_guest.hmod")),
+        horizon_mods::api_level::level_of("render.set-far-terrain")
+    );
+    assert!(LEVEL >= level("horizon_mods_test_ui_guest.hmod"));
 }
 
 #[test]

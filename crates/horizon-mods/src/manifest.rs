@@ -103,9 +103,12 @@ pub enum Capability {
     /// The recipes and items the game knows, for recipe viewers
     /// (interface `recipes`).
     Recipes,
+    /// The player's velocity, pose and camera, rays from the eye, ropes
+    /// (interface `motion`).
+    Motion,
 }
 impl Capability {
-    pub const ALL: [Capability; 12] = [
+    pub const ALL: [Capability; 13] = [
         Capability::GameRead,
         Capability::Chat,
         Capability::Hud,
@@ -118,6 +121,7 @@ impl Capability {
         Capability::Players,
         Capability::World,
         Capability::Recipes,
+        Capability::Motion,
     ];
     /// Whether a server mod may have it: the others act on a local player.
     pub fn on_server(self) -> bool {
@@ -134,6 +138,7 @@ impl Capability {
             Capability::Hud => "hud",
             Capability::Storage => "storage",
             Capability::Command => "command",
+            Capability::Motion => "motion",
             Capability::Registries => "registries",
             Capability::Ui => "ui",
             Capability::Render => "render",
@@ -148,7 +153,11 @@ impl Capability {
     pub fn is_experimental(self) -> bool {
         matches!(
             self,
-            Capability::Ui | Capability::Render | Capability::Input | Capability::Recipes
+            Capability::Ui
+                | Capability::Render
+                | Capability::Input
+                | Capability::Recipes
+                | Capability::Motion
         )
     }
     /// What the player reads before turning the mod on: "May <this>".
@@ -159,6 +168,7 @@ impl Capability {
             Capability::Hud => "draw text on your screen",
             Capability::Storage => "save its own settings to disk",
             Capability::Command => "run commands as you, with your permissions",
+            Capability::Motion => "move you, pose your body and drive the camera",
             Capability::Registries => "add blocks and items to your worlds",
             Capability::Ui => "show its own screens and a settings page",
             Capability::Render => "draw on your screen, shake and zoom the camera",
@@ -204,6 +214,7 @@ impl fmt::Display for Capability {
             Capability::Hud => "hud",
             Capability::Storage => "storage",
             Capability::Command => "command",
+            Capability::Motion => "motion",
             Capability::Registries => "registries",
             Capability::Ui => "ui",
             Capability::Render => "render",
@@ -552,6 +563,13 @@ capabilities = ["game-read", "hud"]
         ))
         .unwrap();
         assert_eq!(m.experimental, [Capability::Ui]);
+        // Movement mods opt in to `motion` the same way.
+        let err = Manifest::parse(&format!("{base}capabilities = [\"motion\"]\n")).unwrap_err();
+        assert!(err.contains("experimental = [\"motion\"]"), "{err}");
+        assert_eq!(
+            Capability::of_import("horizon:mods/motion@0.1.0"),
+            Ok(Some(Capability::Motion))
+        );
         // A capability that is (or became) stable is fine in the list.
         Manifest::parse(&format!(
             "{base}capabilities = [\"hud\"]\nexperimental = [\"hud\"]\n"

@@ -886,7 +886,30 @@ pub fn base_transform_at(m: &Mob, alpha: f32, origin: glam::Mat4) -> glam::Mat4 
         None => super::aquatic::rotations(m, alpha, body)
             .unwrap_or_else(|| glam::Mat4::from_rotation_y((180.0 - body).to_radians())),
     };
-    let mut base = origin * rotation;
+    // A mod's shift of the whole body, in the world.
+    let shift = m
+        .extra
+        .mod_pose
+        .as_ref()
+        .and_then(|p| p.shift)
+        .map_or(glam::Mat4::IDENTITY, |s| {
+            glam::Mat4::from_translation(glam::Vec3::from_array(s))
+        });
+    let mut base = origin * shift * rotation;
+    // A mod's whole-body turn: pitch, then roll, about the middle.
+    if let Some(p) = m
+        .extra
+        .mod_pose
+        .as_ref()
+        .filter(|p| p.pitch != 0.0 || p.roll != 0.0 || p.twist != 0.0)
+    {
+        let middle = glam::Vec3::new(0.0, 0.9, 0.0);
+        base *= glam::Mat4::from_translation(middle)
+            * glam::Mat4::from_rotation_x(p.pitch)
+            * glam::Mat4::from_rotation_z(p.roll)
+            * glam::Mat4::from_rotation_y(p.twist)
+            * glam::Mat4::from_translation(-middle);
+    }
     if m.death_time > 0 && !super::creaking::tearing_down(m) {
         let f = ((m.death_time as f32 + alpha - 1.0) / 20.0 * 1.6)
             .sqrt()
@@ -1204,6 +1227,7 @@ fn render_visible(
         .unwrap_or_else(|| m.kind.model.clone());
     let mut poses = Poses::new(&model);
     anim::setup(m, &s, &mut poses, &data.animations);
+    apply_mod_pose(m, &mut poses);
     let draw_body = |out: &mut Vec<Vertex>| {
         if let Some(uv) = atlas(&texture) {
             draw(
@@ -1252,6 +1276,7 @@ fn render_visible(
         };
         layer_poses.reset(&part);
         anim::setup(m, &s, &mut layer_poses, &data.animations);
+        apply_mod_pose(m, &mut layer_poses);
         if matches!(m.species(), Species::Villager | Species::ZombieVillager)
             && let Some((folder, variant)) = layer
                 .texture
@@ -1458,6 +1483,7 @@ pub fn part_transform(
         .unwrap_or_else(|| m.kind.model.clone());
     let mut poses = Poses::new(&model);
     anim::setup(m, &s, &mut poses, &data.animations);
+    apply_mod_pose(m, &mut poses);
     part_matrix(&model, base, &poses, part, 0.0)
 }
 /// The pose a mob's held item is submitted under (`ItemInHandLayer`:
@@ -1489,6 +1515,7 @@ pub fn held_item_transform(
         .unwrap_or_else(|| m.kind.model.clone());
     let mut poses = Poses::new(&model);
     anim::setup(m, &s, &mut poses, &data.animations);
+    apply_mod_pose(m, &mut poses);
     let mut t = hand_base(m, &model, base, &poses, left)?;
     // ItemInHandLayer: a spear in use (ArmPose.SPEAR's animateUseItem).
     let off_hand = left != m.main_arm_left();
@@ -1506,6 +1533,26 @@ pub fn held_item_transform(
         t *= crate::spear::third_person_use_item(&kinetic, time_held, s.swing, 0.0, !left);
     }
     Some(t)
+}
+
+/// A mod's pose for the player's model, over the vanilla one.
+fn apply_mod_pose(m: &Mob, poses: &mut Poses) {
+    let Some(pose) = &m.extra.mod_pose else {
+        return;
+    };
+    for p in &pose.parts {
+        if !poses.has(&p.part) {
+            continue;
+        }
+        let at = poses.get(&p.part);
+        at[3..6].copy_from_slice(&p.rotation);
+        if let Some(y) = p.pivot_y {
+            at[1] = y;
+        }
+        if let Some(z) = p.pivot_z {
+            at[2] = z;
+        }
+    }
 }
 
 #[cfg(test)]

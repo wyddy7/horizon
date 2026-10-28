@@ -58,6 +58,9 @@ pub enum Ticking {
     Bee { bee: u32, aggressive: bool },
     /// `GuardianAttackSoundInstance`.
     GuardianAttack { guardian: u32 },
+    /// Wind while a `motion` mod moves the player: the elytra's
+    /// loop at the volume the mod asks for.
+    ModWind,
 }
 /// What a minecart's sound instances read about it.
 #[derive(Clone, Copy, Debug)]
@@ -95,6 +98,8 @@ pub struct TickContext {
     pub mobs: Vec<MobSound>,
     /// `!tickRateManager().runsNormally()`.
     pub frozen: bool,
+    /// The wind volume a `motion` mod asks for; None stops it.
+    pub mod_wind: Option<f32>,
 }
 /// `AbstractSoundInstance` and its subclasses' fields.
 #[derive(Clone, Debug)]
@@ -311,6 +316,25 @@ impl SoundInstance {
         s.ticking = Ticking::Minecart { cart: cart.id };
         s
     }
+    /// The mod wind: the elytra's flying loop, silent until the
+    /// mod sets a volume, heard without distance.
+    pub fn mod_wind(random: LegacyRandom) -> Self {
+        let mut s = Self::new(
+            "minecraft:item.elytra.flying",
+            NEUTRAL,
+            0.0,
+            1.0,
+            random,
+            true,
+            0,
+            Attenuation::None,
+            [0.0; 3],
+            true,
+        );
+        s.can_start_silent = true;
+        s.ticking = Ticking::ModWind;
+        s
+    }
     /// `new RidingMinecartSoundInstance(player, minecart, underwater, event, 0, 0.75, 1)`.
     pub fn riding_minecart(cart: &CartSound, underwater: bool, random: LegacyRandom) -> Self {
         let id = if underwater {
@@ -512,6 +536,13 @@ impl SoundInstance {
                 self.volume = 0.0 + 1.0 * scale * scale;
                 self.pitch = 0.7 + 0.5 * scale;
             }
+            Ticking::ModWind => match ctx.mod_wind {
+                Some(volume) if !ctx.player_removed && !ctx.frozen => {
+                    self.volume = volume.clamp(0.0, 0.5);
+                    self.pitch = 0.9 + self.volume * 0.6;
+                }
+                _ => self.stop(),
+            },
             Ticking::RidingMinecart { cart, underwater } => {
                 let (id, underwater) = (*cart, *underwater);
                 let found = ctx.carts.iter().find(|c| c.id == id);

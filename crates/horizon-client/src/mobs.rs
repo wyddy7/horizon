@@ -664,9 +664,34 @@ pub struct Attrs {
 }
 /// `minecraft:wolf_armor`'s maximum damage.
 pub const WOLF_ARMOR_DURABILITY: i32 = 64;
+/// A pose a mod gives the player's model: per part its
+/// rotations in radians (`ModelPart` xRot, yRot, zRot) and optionally its
+/// pivot's y and z, and a whole-body pitch then roll about its middle.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModPose {
+    pub parts: Vec<ModPartPose>,
+    pub pitch: f32,
+    pub roll: f32,
+    /// Then a turn about the body's own up axis.
+    pub twist: f32,
+    /// The body's yaw (degrees) when the mod sets it; else the view's.
+    pub facing: Option<f32>,
+    /// The whole body moved in the world (blocks).
+    pub shift: Option<[f32; 3]>,
+}
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModPartPose {
+    pub part: String,
+    pub rotation: [f32; 3],
+    pub pivot_y: Option<f32>,
+    pub pivot_z: Option<f32>,
+}
 /// Species-specific persistent state (variants, colours, taming, ageing...).
 #[derive(Clone, Debug, Default)]
 pub struct Extra {
+    /// The local player's pose set by a `motion` mod: applied
+    /// after the vanilla animation.
+    pub mod_pose: Option<ModPose>,
     /// Players: crouching and riding (HumanoidModel's poses).
     pub crouching: bool,
     /// A player's or mannequin's synced pose (`Entity.DATA_POSE`), which

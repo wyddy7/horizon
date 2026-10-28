@@ -19,6 +19,7 @@ The contract between Horizon and its mods: the WIT package `horizon:mods@0.1.0`,
 | `players` | [`players`](#players) | see who is on the server and message them |
 | `world` | [`world`](#world) | read and change the world's blocks |
 | `recipes` | [`recipes`](#recipes) | read the game's recipes and items and which recipes you know, place recipes in your crafting grid and, in creative mode, give you items |
+| `motion` | [`motion`](#motion) | move you, pose your body and drive the camera |
 
 ## World `horizon-mod`
 
@@ -38,7 +39,7 @@ A server mod (manifest `side = "server"`, `api = "0.3"`, experimental): runs whe
 
 A mod with widgets (capability `ui`): the SDK builds every mod against this world. Mods built for `horizon-mod` alone (no `ui-events` export) still load and simply hear nothing of their widgets.
 
-- Imports (what the game offers): `ui`, `render`, `input`, `recipes`, `browser`, `log`, `game`, `chat`, `hud`, `storage`, `command`
+- Imports (what the game offers): `ui`, `render`, `input`, `recipes`, `browser`, `motion`, `log`, `game`, `chat`, `hud`, `storage`, `command`
 - Exports (what the mod provides): `ui-events`, `events`
 
 ## World `ui-host`
@@ -60,6 +61,13 @@ The game's side of capability `render` (imports only).
 The game's side of capability `recipes` (imports only).
 
 - Imports (what the game offers): `recipes`, `browser`
+- Exports (what the mod provides): 
+
+## World `motion-host`
+
+The game's side of capability `motion` (imports only).
+
+- Imports (what the game offers): `motion`
 - Exports (what the mod provides): 
 
 ## `log`
@@ -454,6 +462,107 @@ Any four-cornered shape (a wheel's segment, an arrow): the corners in order roun
 | `set-zoom` | `func(zoom: zoom)` | Zooms the camera until the next call (`factor` 1 ends it), only while playing: a screen opening or the spyglass's own view (which wins) leave the camera vanilla's. With several mods, the strongest zoom counts. |
 | `set-minimap` | `func(minimap: option<minimap>)` | Shows a map of the world around the player in `corner`, stacked with the game's overlays and the mods' panels, until the next call (none hides it). It looks like a map item: vanilla's map colours with their height shading and water depth, and the player's arrow. Underground, under a roof and in the Nether it maps the floor around the player's height. The game keeps the map's tiles and refreshes them within its own frame budget; hidden, they are dropped. One map shows at a time: the first loaded mod's. |
 | `set-far-terrain` | `func(far-terrain: option<far-terrain>)` | Draws the world beyond the render distance as distant terrain, out to `distance` chunks, until the next call (none ends it). The game builds it on its own workers, from the chunks already loaded or saved and, where nobody has been, from the world's generator; the simulation distance doesn't change. Only worlds whose generator the game has (single player and a LAN world you host) show it. The player's own LOD Distance setting, when on, wins. One far terrain shows at a time: the first loaded mod's. |
+
+## `motion`
+
+Access: capability `motion`.
+
+Capability `motion` (experimental: the manifest needs `experimental = ["motion"]`): what a movement mod (grappling hooks, web swinging, wall running) reads and the push it gives back. Its keys come from `input`, a camera shake from `render`. It acts only in the player's own world (single player, or a LAN world they host): on another server `get` is none and the rest do nothing. Read once per tick like `game`; what a mod sets in `tick` applies to the player's next move.
+
+### record `vec3`
+
+| Field | Type | |
+| --- | --- | --- |
+| `x` | `f64` |  |
+| `y` | `f64` |  |
+| `z` | `f64` |  |
+
+### record `ray`
+
+A ray the game casts for the mod at the start of every tick, from where the player then is (see `set-rays`).
+
+| Field | Type | |
+| --- | --- | --- |
+| `from-eyes` | `bool` | From the eyes, else from the feet; then moved by `offset` (blocks, at most 64 on each axis). |
+| `offset` | `vec3` |  |
+| `dir` | `vec3` | Unit direction. |
+| `distance` | `f64` | Blocks, at most 256. |
+| `solid` | `bool` | Against collision boxes (what can be stood on and run into: grass and flowers pass), else against outlines (what the crosshair picks). Fluids pass either way. |
+
+### record `state`
+
+| Field | Type | |
+| --- | --- | --- |
+| `velocity` | `vec3` | Blocks per tick. |
+| `on-ground` | `bool` |  |
+| `eye` | `vec3` |  |
+| `look` | `vec3` | Unit view vector (turned with the wall camera's view, so a ray along it stays under the crosshair). |
+| `hits` | `list<option<f64>>` | For each ray of the last `set-rays`, in order: how far along it the first box is, cast at the start of this tick; none past its distance. Empty before the first `set-rays`. |
+
+### record `rope`
+
+A line from the player's hand to `to`, drawn every frame until the mod sets other ropes.
+
+| Field | Type | |
+| --- | --- | --- |
+| `to` | `vec3` |  |
+| `color` | `u32` | 0xRRGGBB. |
+| `progress` | `f32` | How much of the way to `to` is drawn, 0..1 (a web still flying). |
+| `wave` | `f32` | Zigzag amplitude in blocks across the line (0: straight). |
+| `from` | `option<vec3>` | Where the line starts, from the player's feet (as drawn, between ticks); none for the vanilla hand. |
+
+### record `part-pose`
+
+One part of the player's model (`head`, `body`, `right_arm`, `left_arm`, `right_leg`, `left_leg`): rotations in radians as `ModelPart` xRot, yRot and zRot, and optionally its pivot's y and z.
+
+| Field | Type | |
+| --- | --- | --- |
+| `part` | `string` |  |
+| `pitch` | `f32` |  |
+| `yaw` | `f32` |  |
+| `roll` | `f32` |  |
+| `pivot-y` | `option<f32>` |  |
+| `pivot-z` | `option<f32>` |  |
+
+### record `chase-camera`
+
+Behind the player along the view, `distance` back, `height` above the eyes and `side` to the right (blocks); pulled in by walls, and moved to the side with more room when a wall is close behind.
+
+| Field | Type | |
+| --- | --- | --- |
+| `distance` | `f32` |  |
+| `height` | `f32` |  |
+| `side` | `f32` |  |
+| `wall` | `option<vec3>` | The wall-as-floor view (Web of Shadows): the unit direction toward the wall the player runs on, and how far the camera has turned into it, 0 (the chase camera) to 1 (rolled 90 degrees, the wall below, looking up it). |
+| `wall-blend` | `f32` |  |
+
+### record `fixed-camera`
+
+A camera standing at `at`, looking at `look-at` (the player's model is drawn): for checking poses from a fixed side.
+
+| Field | Type | |
+| --- | --- | --- |
+| `at` | `vec3` |  |
+| `look-at` | `vec3` |  |
+
+### variant `camera`
+
+| Case | Payload | |
+| --- | --- | --- |
+| `chase` | `chase-camera` |  |
+| `fixed` | `fixed-camera` |  |
+
+| Function | Signature | What it does |
+| --- | --- | --- |
+| `get` | `func() -> option<state>` | None on the title screen and on another server. |
+| `set-velocity` | `func(v: vec3)` | Replaces the player's velocity for its next move; clipped to 5 blocks per tick. |
+| `reset-fall` | `func()` | Forgets the fall so far, for this tick: the world's server hears the player as on the ground. Call it every tick a fall should not count; called once mid-fall, the fall up to then lands as damage. |
+| `set-ropes` | `func(ropes: list<rope>)` | At most 4 ropes. |
+| `set-rays` | `func(rays: list<ray>)` | The rays to cast every tick until set again, at most 128: their hits come back in `state.hits` from the next tick on. |
+| `set-pose` | `func(parts: list<part-pose>, pitch: f32, roll: f32, twist: f32, facing: option<f32>, shift: option<vec3>)` | Poses the player's own model (seen in third person) over the vanilla animation until cleared; `pitch` (forward is negative) and then `roll` (radians) turn the whole body about its middle. Set once per tick; the game blends between ticks. `facing`: the body's yaw in degrees as F3 shows it (none: the view's). `shift`: the whole body moved this far in the world (blocks, at most 2). `twist`: then a turn about the body's own up axis (radians). |
+| `set-wind` | `func(volume: f32)` | Wind heard while moving, 0..0.5 of the elytra loop's volume, until set again; the game stops it when the mod stops setting it. |
+| `set-camera` | `func(camera: option<camera>)` | The third-person camera until set again; none gives the game's own. |
+| `clear-pose` | `func()` | Gives the player's model back to the game's own animation. |
 
 ## `events`
 

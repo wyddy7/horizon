@@ -29,8 +29,8 @@ use {
         ui,
     },
     horizon_mods::{
-        Clock, ModKey, Mods, Output, Player, Runs, ServerPlayer, Snapshot, Status, UiScreen,
-        UiWidget,
+        Clock, ModKey, Mods, MotionState, MotionVec, Output, Player, Runs, ServerPlayer, Snapshot,
+        Status, UiScreen, UiWidget,
     },
     std::time::Instant,
     winit::{event::MouseButton, keyboard::KeyCode},
@@ -104,6 +104,26 @@ pub(super) struct ModsState {
     /// Playing at the last frame, for `mod_input_frame`.
     #[cfg(feature = "mods")]
     pub(super) playing: bool,
+    /// A `motion` mod forgot the fall this tick: the player's own world's
+    /// server hears the player as grounded, so no fall builds up.
+    pub(super) safe_fall: bool,
+    /// A `motion` mod's pose for the player's model, last tick's and this
+    /// tick's, blended in between when drawn.
+    pub(super) pose: [Option<horizon_client::mobs::ModPose>; 2],
+    /// A `motion` mod's wind volume, and whether its loop is playing.
+    pub(super) wind: Option<f32>,
+    pub(super) wind_playing: bool,
+    /// A `motion` mod's camera.
+    #[cfg(feature = "mods")]
+    pub(super) camera: Option<horizon_mods::ModCamera>,
+    /// The chase camera's eased distance back and side offset, and when
+    /// they were last eased: only the mouse turns the camera at once.
+    #[cfg(feature = "mods")]
+    pub(super) cam_ease: std::cell::Cell<Option<(f64, f64, std::time::Instant)>>,
+    /// The wall turn eased per frame (the mod steps it per tick: 20 steps a
+    /// second read as a staircase), and when it was last eased.
+    #[cfg(feature = "mods")]
+    pub(super) wall_ease: std::cell::Cell<(f64, Option<std::time::Instant>)>,
 }
 
 /// The mappings `input.mapping` answers for, with the default key their
@@ -289,6 +309,9 @@ impl Game<'_> {
         false
     }
     pub(super) fn mod_screen_scroll(&mut self, _delta: f32) {}
+    pub(super) fn mod_ropes(&self) -> Vec<([f64; 3], u32, f32, f32, Option<[f64; 3]>)> {
+        Vec::new()
+    }
 }
 
 #[cfg(feature = "mods")]
@@ -495,6 +518,13 @@ impl Game<'_> {
                 .collect();
         }
         let (recipes, known_recipes) = self.mod_recipes();
+        let motion = self
+            .mods
+            .mods
+            .wants_motion()
+            .then(|| self.motion_state())
+            .filter(|_| self.motion_allowed())
+            .flatten();
         Snapshot {
             player,
             clock,
@@ -510,6 +540,7 @@ impl Game<'_> {
             known_recipes,
             placing: self.mod_recipe_screen(),
             creative: self.creative,
+            motion,
         }
     }
     /// The first block along the player's view within
@@ -613,6 +644,138 @@ impl Game<'_> {
             lines.len()
         );
     }
+    /// Capability `motion`'s view: velocity, the eyes and the view; each
+    /// mod's ray hits are filled in by [`Game::cast_motion_rays`].
+    fn motion_state(&self) -> Option<MotionState> {
+        let p = self.player.as_ref()?;
+        let eye = self.eye_position()?;
+        let vec = |v: [f64; 3]| MotionVec {
+            x: v[0],
+            y: v[1],
+            z: v[2],
+        };
+        // The view follows the wall camera's turn: a ray along it stays
+        // under the crosshair.
+        let look = self.mod_wall_turn()
+            * glam::DVec3::from_array(super::view_vector(self.yaw, self.pitch));
+        Some(MotionState {
+            velocity: vec([p.velocity.x, p.velocity.y, p.velocity.z]),
+            on_ground: p.ground.on_ground,
+            eye: vec(eye),
+            look: vec(look.to_array()),
+            hits: Vec::new(),
+        })
+    }
+    /// Capability `motion` acts only in the player's own world: single
+    /// player, or a LAN world they host. On another server a motion mod
+    /// reads nothing and moves nothing, and that server sees the player as
+    /// it sees any other.
+    pub(super) fn motion_allowed(&self) -> bool {
+        self.remote
+            .as_ref()
+            .is_none_or(|r| r.session.address == "local")
+    }
+    /// Forgets what motion mods asked for: none runs, or not here.
+    fn clear_motion(&mut self) {
+        self.mods.safe_fall = false;
+        self.mods.pose = [None, None];
+        self.mods.wind = None;
+        self.mods.camera = None;
+        self.mods.cam_ease.set(None);
+        self.mods.wall_ease.set((0.0, None));
+    }
+    /// Capability `motion`: casts each running mod's rays from where the
+    /// player is now, before the mods tick; [`RAY_BUDGET`] a tick in all.
+    fn cast_motion_rays(&mut self) {
+        use horizon_core::geometry::Axis;
+        /// Rays cast a tick across every mod; the rest find nothing.
+        const RAY_BUDGET: usize = 256;
+        if !self.motion_allowed() {
+            return;
+        }
+        let (Some(p), Some(eye)) = (self.player.as_ref(), self.eye_position()) else {
+            return;
+        };
+        let mut budget = RAY_BUDGET;
+        let feet = [p.position.x, p.position.y, p.position.z];
+        let world = self.mob_world_base(&[]);
+        let solid = |pos: [i32; 3]| {
+            let boxes: Vec<[f64; 6]> = world
+                .block_collision_boxes(pos[0], pos[1], pos[2])
+                .into_iter()
+                .map(|b| {
+                    [
+                        b.min(Axis::X),
+                        b.min(Axis::Y),
+                        b.min(Axis::Z),
+                        b.max(Axis::X),
+                        b.max(Axis::Y),
+                        b.max(Axis::Z),
+                    ]
+                })
+                .collect();
+            (!boxes.is_empty()).then_some(boxes)
+        };
+        let all: Vec<_> = self
+            .mods
+            .mods
+            .motion_rays()
+            .into_iter()
+            .map(|(i, rays)| {
+                let hits = rays
+                    .iter()
+                    .map(|r| {
+                        if budget == 0 {
+                            return None;
+                        }
+                        budget -= 1;
+                        let base = if r.from_eyes { eye } else { feet };
+                        let from = [
+                            base[0] + r.offset.x,
+                            base[1] + r.offset.y,
+                            base[2] + r.offset.z,
+                        ];
+                        let dir = glam::DVec3::new(r.dir.x, r.dir.y, r.dir.z).normalize_or_zero();
+                        if dir == glam::DVec3::ZERO {
+                            return None;
+                        }
+                        let dir = dir.to_array();
+                        let hit = if r.solid {
+                            self.clip_boxes(from, dir, r.distance, solid)
+                        } else {
+                            self.clip_ray(from, dir, r.distance)
+                        };
+                        hit.map(|h| {
+                            glam::DVec3::from_array(h.point).distance(glam::DVec3::from_array(from))
+                        })
+                    })
+                    .collect();
+                (i, hits)
+            })
+            .collect();
+        for (i, hits) in all {
+            self.mods.mods.set_motion_hits(i, hits);
+        }
+    }
+    /// Every running mod's ropes: where each ends and its 0xRRGGBB.
+    pub(super) fn mod_ropes(&self) -> Vec<([f64; 3], u32, f32, f32, Option<[f64; 3]>)> {
+        if !self.motion_allowed() {
+            return Vec::new();
+        }
+        self.mods
+            .mods
+            .ropes()
+            .map(|r| {
+                (
+                    [r.to.x, r.to.y, r.to.z],
+                    r.color,
+                    r.progress,
+                    r.wave,
+                    r.from.as_ref().map(|f| [f.x, f.y, f.z]),
+                )
+            })
+            .collect()
+    }
     /// A game tick.
     pub(super) fn tick_mods(&mut self) {
         // Here, at the player's level: shown inside a console call (a control
@@ -624,12 +787,56 @@ impl Game<'_> {
             self.run_quiet_batch(&mod_id, &lines);
         }
         if !self.mods.mods.is_running() {
+            self.clear_motion();
             return;
         }
         self.tick_mod_use();
         let snapshot = self.mod_snapshot();
         self.mods.mods.set_snapshot(snapshot);
+        self.cast_motion_rays();
         self.mods.mods.tick(self.ticks);
+        // Capability `motion`: what the mods asked of the player, for its
+        // next move. Only in the player's own world.
+        let request = self.mods.mods.take_motion();
+        if !self.motion_allowed() {
+            self.clear_motion();
+            self.show_mod_output();
+            return;
+        }
+        self.mods.safe_fall = request.reset_fall;
+        let pose = self
+            .mods
+            .mods
+            .pose()
+            .map(
+                |(parts, [pitch, roll, twist], facing, shift)| horizon_client::mobs::ModPose {
+                    parts: parts
+                        .iter()
+                        .map(|p| horizon_client::mobs::ModPartPose {
+                            part: p.part.clone(),
+                            rotation: [p.pitch, p.yaw, p.roll],
+                            pivot_y: p.pivot_y,
+                            pivot_z: p.pivot_z,
+                        })
+                        .collect(),
+                    pitch: *pitch,
+                    roll: *roll,
+                    twist: *twist,
+                    facing: *facing,
+                    shift: *shift,
+                },
+            );
+        self.mods.pose = [self.mods.pose[1].take(), pose];
+        self.mods.wind = self.mods.mods.wind();
+        self.mods.camera = self.mods.mods.camera();
+        if let Some(p) = self.player.as_mut() {
+            if let Some(v) = request.velocity {
+                p.velocity = horizon_core::geometry::Vec3::new(v[0], v[1], v[2]);
+            }
+            if request.reset_fall {
+                p.fall_distance = 0.0;
+            }
+        }
         self.show_mod_output();
     }
     /// Restarts the dev mods rebuilt since the last check, once a second.
@@ -1266,3 +1473,203 @@ const MOD_UI_COLUMN: f32 = 200.0;
 /// A key row's height with its gap, as the widgets below it space out.
 #[cfg(feature = "mods")]
 const MOD_UI_KEY_ROW: f32 = 26.0;
+/// How far from the player a mod's fixed camera may stand, in blocks.
+#[cfg(feature = "mods")]
+const FIXED_CAMERA_REACH: f64 = 16.0;
+impl Game<'_> {
+    /// The mod's pose for the player's model this frame: the last two ticks'
+    /// blended by `alpha`.
+    pub(super) fn mod_pose(&self, alpha: f32) -> Option<horizon_client::mobs::ModPose> {
+        let [prev, cur] = &self.mods.pose;
+        let mut pose = cur.clone()?;
+        let Some(prev) = prev else {
+            return Some(pose);
+        };
+        let lerp = |a: f32, b: f32| {
+            // A jump of more than half a turn (a flip ending) is not blended.
+            if (b - a).abs() > std::f32::consts::PI {
+                b
+            } else {
+                a + (b - a) * alpha
+            }
+        };
+        pose.pitch = lerp(prev.pitch, pose.pitch);
+        pose.roll = lerp(prev.roll, pose.roll);
+        pose.twist = lerp(prev.twist, pose.twist);
+        for part in &mut pose.parts {
+            if let Some(p) = prev.parts.iter().find(|p| p.part == part.part) {
+                for i in 0..3 {
+                    part.rotation[i] = lerp(p.rotation[i], part.rotation[i]);
+                }
+                if let (Some(a), Some(b)) = (p.pivot_y, part.pivot_y) {
+                    part.pivot_y = Some(lerp(a, b));
+                }
+                if let (Some(a), Some(b)) = (p.pivot_z, part.pivot_z) {
+                    part.pivot_z = Some(lerp(a, b));
+                }
+            }
+        }
+        Some(pose)
+    }
+}
+
+#[cfg(feature = "mods")]
+impl Game<'_> {
+    /// The wall camera's turn of the whole view (identity off the wall): the
+    /// same turn applies to the aim, so the crosshair stays true.
+    pub(super) fn mod_wall_turn(&self) -> glam::DQuat {
+        match self.mods.camera.as_ref() {
+            Some(horizon_mods::ModCamera::Chase(c)) if !self.camera_type.first_person() => {
+                // Ease toward the mod's blend every frame, smoothly.
+                let now = std::time::Instant::now();
+                let (cur, then) = self.mods.wall_ease.get();
+                let dt = then.map_or(0.0, |t| now.duration_since(t).as_secs_f64().min(0.1));
+                let want = f64::from(c.wall_blend);
+                let k = cur + (want - cur) * (1.0 - (-8.0_f64 * dt).exp());
+                self.mods.wall_ease.set((k, Some(now)));
+                match &c.wall {
+                    Some(w) if k > 1e-3 => {
+                        let w = glam::DVec3::new(w.x, w.y, w.z).normalize_or_zero();
+                        glam::DQuat::IDENTITY
+                            .slerp(glam::DQuat::from_rotation_arc(glam::DVec3::Y, -w), k)
+                    }
+                    _ => glam::DQuat::IDENTITY,
+                }
+            }
+            _ => glam::DQuat::IDENTITY,
+        }
+    }
+    /// True while a mod's fixed camera looks at the player.
+    pub(super) fn mod_camera_fixed(&self) -> bool {
+        matches!(self.mods.camera, Some(horizon_mods::ModCamera::Fixed(_)))
+    }
+    /// A mod's camera: the position, yaw and pitch to render
+    /// from, or None for the game's own camera.
+    pub(super) fn mod_camera_view(&self, partial: f32) -> Option<(glam::DVec3, f32, f32)> {
+        horizon_client::camera::set_view_turn(None);
+        let look_from = |from: glam::DVec3, to: glam::DVec3| {
+            let d = (to - from).normalize_or_zero();
+            let yaw = (-d.x).atan2(d.z).to_degrees() as f32;
+            let pitch = (-d.y.clamp(-1.0, 1.0)).asin().to_degrees() as f32;
+            (from, yaw, pitch)
+        };
+        match self.mods.camera.as_ref()? {
+            horizon_mods::ModCamera::Fixed(f) => {
+                // Near the player: a view of the body, not a free camera.
+                let p = self.player.as_ref()?;
+                let body = glam::DVec3::new(p.position.x, p.position.y, p.position.z);
+                let near = |v: &horizon_mods::MotionVec| {
+                    body + (glam::DVec3::new(v.x, v.y, v.z) - body)
+                        .clamp_length_max(FIXED_CAMERA_REACH)
+                };
+                Some(look_from(near(&f.at), near(&f.look_at)))
+            }
+            horizon_mods::ModCamera::Chase(c) => {
+                if self.camera_type.first_person() {
+                    return None;
+                }
+                let p = self.player.as_ref()?;
+                let a = f64::from(partial);
+                let feet = glam::DVec3::new(
+                    self.previous_position.x + (p.position.x - self.previous_position.x) * a,
+                    self.previous_position.y + (p.position.y - self.previous_position.y) * a,
+                    self.previous_position.z + (p.position.z - self.previous_position.z) * a,
+                );
+                let eye = feet + glam::DVec3::new(0.0, f64::from(p.dimensions.eye_height), 0.0);
+                // The mouse turns the camera as always. On a tall wall the
+                // whole view is turned (eased by `wall_blend`) so the wall is
+                // the floor (Web of Shadows): the same mouse look, in a frame
+                // whose up points away from the wall; looking at the wall
+                // becomes looking up it.
+                let turn = self.mod_wall_turn();
+                let k = if turn.angle_between(glam::DQuat::IDENTITY) > 1e-4 {
+                    1.0
+                } else {
+                    0.0
+                };
+                let up = turn * glam::DVec3::Y;
+                let look = turn * glam::DVec3::from_array(super::view_vector(self.yaw, self.pitch));
+                let right = look.cross(up).normalize_or_zero();
+                let pivot = eye + up * f64::from(c.height);
+                let reach = |side: f64| {
+                    let want = pivot - look * f64::from(c.distance) + right * side;
+                    let dir = want - pivot;
+                    let len = dir.length();
+                    let hit =
+                        self.clip_ray(pivot.to_array(), (dir / len.max(1e-6)).to_array(), len);
+                    match hit {
+                        // Stop short of the wall the ray met.
+                        Some(h) => {
+                            let at = glam::DVec3::from_array(h.point);
+                            let room = (at - pivot).length();
+                            (
+                                pivot + (at - pivot) * ((room - 0.4).max(0.0) / room.max(1e-6)),
+                                room / len.max(1e-6),
+                            )
+                        }
+                        None => (want, 1.0),
+                    }
+                };
+                // A wall close behind: try the sides and take the roomier.
+                let side = f64::from(c.side);
+                let (mut at, room) = reach(side);
+                let mut want_side = side;
+                if room < 0.6 {
+                    for s in [side + 3.0, side - 3.0] {
+                        let (alt, r) = reach(s);
+                        if r > room + 0.2 {
+                            at = alt;
+                            want_side = s;
+                            break;
+                        }
+                    }
+                }
+                // Ease the distance and the side so the camera never jumps:
+                // pulled in fast (no clipping), let out and slid slowly.
+                let want_back = (pivot - at).dot(look).max(0.5);
+                let now = std::time::Instant::now();
+                let (back, side) = match self.mods.cam_ease.get() {
+                    Some((back, side, then)) => {
+                        let dt = now.duration_since(then).as_secs_f64().min(0.1);
+                        let ease = |cur: f64, want: f64, rate: f64| {
+                            cur + (want - cur) * (1.0 - (-rate * dt).exp())
+                        };
+                        let back = if want_back < back {
+                            ease(back, want_back, 30.0)
+                        } else {
+                            ease(back, want_back, 3.0)
+                        };
+                        (back, ease(side, want_side, 4.0))
+                    }
+                    None => (want_back, want_side),
+                };
+                self.mods.cam_ease.set(Some((back, side, now)));
+                let at = pivot - look * back + right * side;
+                let (at, yaw, pitch) = look_from(at, at + look);
+                // The roll that turns the view's own up onto `up`.
+                // The whole orientation goes to the renderer: angles break
+                // down when the view runs up a wall.
+                if k > 0.0 {
+                    let right = look.cross(up).normalize_or_zero();
+                    let up = right.cross(look);
+                    let basis =
+                        glam::Mat3::from_cols(right.as_vec3(), up.as_vec3(), (-look).as_vec3());
+                    horizon_client::camera::set_view_turn(Some(glam::Quat::from_mat3(&basis)));
+                }
+                Some((at, yaw, pitch))
+            }
+        }
+    }
+}
+#[cfg(not(feature = "mods"))]
+impl Game<'_> {
+    pub(super) fn mod_camera_fixed(&self) -> bool {
+        false
+    }
+    pub(super) fn mod_camera_view(&self, _partial: f32) -> Option<(glam::DVec3, f32, f32)> {
+        None
+    }
+    pub(super) fn mod_wall_turn(&self) -> glam::DQuat {
+        glam::DQuat::IDENTITY
+    }
+}

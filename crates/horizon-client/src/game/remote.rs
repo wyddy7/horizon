@@ -4303,7 +4303,16 @@ impl Game<'_> {
         };
         let (pos, on_ground, collision, sprinting) = (
             [p.position.x, p.position.y, p.position.z],
-            p.ground.on_ground,
+            // A `motion` mod forgot the fall: the player's own world's
+            // server (single player, or the LAN host's) hears the player as
+            // grounded, so no fall builds up. Never on another server: there
+            // the server's own fall counts, as for any client.
+            p.ground.on_ground
+                || (self.mods.safe_fall
+                    && self
+                        .remote
+                        .as_ref()
+                        .is_some_and(|r| r.session.address == "local")),
             p.collision.horizontal,
             p.sprinting,
         );

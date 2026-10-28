@@ -196,6 +196,9 @@ impl Game<'_> {
     /// front of) it, pulled in where visual shapes are in the way. Returns the
     /// position, yaw and pitch to render from.
     pub(super) fn camera_view(&mut self, partial: f32) -> Option<(glam::DVec3, f32, f32)> {
+        if let Some(view) = self.mod_camera_view(partial) {
+            return Some(view);
+        }
         let (scale, distance) = {
             let p = self.player.as_mut()?;
             (
@@ -433,7 +436,7 @@ impl Game<'_> {
     /// Whether the player's own model shows in the world view.
     fn player_model_shown(&self) -> bool {
         // A shader pack's shadow pass draws the player in first person too (shadowPlayer).
-        (!self.camera_type.first_person() || self.pack_shadow_casters.1)
+        (!self.camera_type.first_person() || self.pack_shadow_casters.1 || self.mod_camera_fixed())
             && self.sleeping.is_none()
             && !self.spectator()
             && self.potions.effects.get("minecraft:invisibility").is_none()
@@ -464,6 +467,23 @@ impl Game<'_> {
         let atlas = &self.gui.atlas;
         let lookup = |name: &str| atlas.sprites.get(name).map(|r| [r.u0, r.v0, r.u1, r.v1]);
         let start = out.len();
+        // A `motion` mod's pose over the vanilla animation.
+        let posed;
+        let m = match self.mod_pose(alpha as f32) {
+            Some(pose) => {
+                let mut copy = m.clone();
+                // A posed body faces where the mod says (a wall it runs on),
+                // else where the player looks (a still body otherwise lags
+                // the head by up to 50 degrees).
+                let facing = pose.facing.unwrap_or(self.yaw);
+                copy.extra.mod_pose = Some(pose);
+                copy.body_yaw = facing;
+                copy.previous_body_yaw = facing;
+                posed = copy;
+                &posed
+            }
+            None => m,
+        };
         horizon_client::mobs::render::render_with(
             m,
             alpha as f32,

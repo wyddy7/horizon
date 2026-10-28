@@ -2123,10 +2123,37 @@ impl Game<'_> {
             });
         }
         let origin = self.eye_position()?;
-        self.clip_ray(origin, view_vector(self.yaw, self.pitch), self.reach())
+        // A motion mod's wall camera turns the view: the pick follows it, so
+        // the block under the crosshair is the one picked.
+        let dir = self.mod_wall_turn() * glam::DVec3::from_array(view_vector(self.yaw, self.pitch));
+        self.clip_ray(origin, dir.to_array(), self.reach())
     }
     /// The first block outline hit within `reach` along the unit `dir`.
     fn clip_ray(&self, origin: [f64; 3], dir: [f64; 3], reach: f64) -> Option<Hit> {
+        self.clip_boxes(origin, dir, reach, |pos| {
+            let state = self.world.block(pos[0], pos[1], pos[2]);
+            let f = self.res.facts().get(state);
+            (!self.res.facts().is_air(state)
+                && (f.fluid == Fluid::None
+                    || f.waterlogged
+                    || &*f.name == "minecraft:kelp"
+                    || f.render_shape == horizon_client::blocks::RenderShape::Model)
+                && !matches!(
+                    &*f.name,
+                    "minecraft:water" | "minecraft:lava" | "minecraft:bubble_column"
+                ))
+            .then(|| self.outline_boxes(pos))
+        })
+    }
+    /// The first of the boxes `boxes` gives for each block along the unit
+    /// `dir` (world coordinates, none to pass the block) within `reach`.
+    fn clip_boxes(
+        &self,
+        origin: [f64; 3],
+        dir: [f64; 3],
+        reach: f64,
+        boxes: impl Fn([i32; 3]) -> Option<Vec<[f64; 6]>>,
+    ) -> Option<Hit> {
         let mut pos = origin.map(|v| v.floor() as i32);
         let step = dir.map(|d| if d > 0.0 { 1 } else { -1 });
         let delta = dir.map(|d| {
@@ -2152,21 +2179,10 @@ impl Game<'_> {
         let mut face = [0; 3];
         let mut t = 0.0;
         while t <= reach {
-            let state = self.world.block(pos[0], pos[1], pos[2]);
-            let f = self.res.facts().get(state);
-            if !self.res.facts().is_air(state)
-                && (f.fluid == Fluid::None
-                    || f.waterlogged
-                    || &*f.name == "minecraft:kelp"
-                    || f.render_shape == horizon_client::blocks::RenderShape::Model)
-                && !matches!(
-                    &*f.name,
-                    "minecraft:water" | "minecraft:lava" | "minecraft:bubble_column"
-                )
-            {
+            if let Some(boxes) = boxes(pos) {
                 // The nearest entry into one of the outline's boxes (slab method).
                 let mut best: Option<(f64, [i32; 3])> = None;
-                for b in self.outline_boxes(pos) {
+                for b in boxes {
                     let (mut t0, mut t1, mut axis_in, mut sign) = (0.0f64, f64::INFINITY, None, 0);
                     let mut miss = false;
                     for a in 0..3 {
@@ -8253,6 +8269,7 @@ impl Game<'_> {
         self.fishing_geometry(camera, alpha, &mut out);
         self.mark_entity(out.len(), "minecraft:leash_knot");
         self.leash_geometry(camera, alpha, &mut out);
+        self.mod_rope_geometry(camera, alpha, &mut out);
         self.mark_entity(out.len(), "minecraft:trident");
         self.trident_geometry(camera, alpha, &mut out);
         self.mark_entity(out.len(), "minecraft:firework_rocket");

@@ -592,6 +592,12 @@ impl Game<'_> {
             "chat" => {
                 let text = line.trim_start().strip_prefix("chat").unwrap_or("").trim();
                 if self.remote.is_some() {
+                    // As typed: a client mod's own command stays here.
+                    if let Some(command) = text.strip_prefix('/')
+                        && self.mod_command(command)
+                    {
+                        return ok();
+                    }
                     self.send_chat(text);
                     return ok();
                 }

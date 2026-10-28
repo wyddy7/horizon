@@ -35,6 +35,15 @@ impl Game<'_> {
         }
         let (vehicle, carts) = self.start_cart_sounds();
         let mobs = self.start_mob_sounds();
+        // A `motion` mod's wind: one loop while it asks for one.
+        let mod_wind = self.mods.wind;
+        if mod_wind.is_some() && !self.mods.wind_playing {
+            let instance = horizon_client::sound_engine::SoundInstance::mod_wind(
+                horizon_client::sound_engine::SoundEngine::unseeded(),
+            );
+            horizon_client::sound_engine::Sounds::play_instance(&mut self.audio, instance, false);
+        }
+        self.mods.wind_playing = mod_wind.is_some();
         let ctx = TickContext {
             player_underwater: self.ambience.was_underwater(),
             player_removed: self.player.is_none(),
@@ -42,6 +51,7 @@ impl Game<'_> {
             carts,
             mobs,
             frozen: !self.clock.runs_normally(),
+            mod_wind,
         };
         self.audio.tick(self.pause, &ctx);
     }

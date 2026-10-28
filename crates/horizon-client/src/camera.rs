@@ -288,8 +288,24 @@ pub mod joml {
 }
 use joml::{Mat4, Quat};
 
+/// A whole camera orientation set by a `motion` mod's wall camera,
+/// as a quaternion taking the camera's axes (right +x, up +y, looking -z)
+/// to the world; it replaces yaw, pitch and roll while set.
+static VIEW_TURN: std::sync::Mutex<Option<[f32; 4]>> = std::sync::Mutex::new(None);
+pub fn set_view_turn(q: Option<glam::Quat>) {
+    *VIEW_TURN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = q.map(|q| q.to_array());
+}
+
 /// Camera-relative world view used by terrain, sky and the first-person hand.
 pub fn view_matrix(yaw: f32, pitch: f32) -> glam::Mat4 {
+    if let Some(q) = *VIEW_TURN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        return glam::Mat4::from_quat(glam::Quat::from_array(q).conjugate());
+    }
     // Vanilla uses the conjugate of Camera.rotation, not a world-up look-at.
     let q = Quat::rotation_yxz(PI - yaw * DEG_TO_RAD, -pitch * DEG_TO_RAD, 0.0);
     glam::Mat4::from_quat(glam::Quat::from_xyzw(-q.x, -q.y, -q.z, q.w))

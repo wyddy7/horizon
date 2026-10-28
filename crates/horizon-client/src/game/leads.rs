@@ -424,6 +424,67 @@ impl Game<'_> {
             );
         }
     }
+    /// Ropes from mods with capability `motion`: a thin
+    /// straight strip from the player's hand, both faces, full bright.
+    pub(super) fn mod_rope_geometry(&self, camera: glam::DVec3, alpha: f64, out: &mut Vec<Vertex>) {
+        let ropes = self.mod_ropes();
+        let Some(p) = self.player.as_ref().filter(|_| !ropes.is_empty()) else {
+            return;
+        };
+        let white = self.gui.atlas.font.white();
+        let uv = [
+            [white.u0, white.v1],
+            [white.u1, white.v1],
+            [white.u1, white.v0],
+            [white.u0, white.v0],
+        ];
+        // The hand rides the camera: the player's position between the last
+        // two ticks, as the view is drawn, not the tick's own.
+        let lag = glam::DVec3::new(
+            self.previous_position.x - p.position.x,
+            self.previous_position.y - p.position.y,
+            self.previous_position.z - p.position.z,
+        ) * (1.0 - alpha);
+        let hold = self.player_rope_hold(p, alpha) + lag;
+        let feet = glam::DVec3::new(p.position.x, p.position.y, p.position.z) + lag;
+        for (to, rgb, progress, wave, from) in ropes {
+            let start = from.map_or(hold, |f| feet + glam::DVec3::from_array(f));
+            let d = (glam::DVec3::from_array(to) - start) * f64::from(progress);
+            // A ribbon facing the camera: across both the rope and the view.
+            let side = d.cross(start - camera).normalize_or_zero();
+            let across = side * 0.025;
+            let color = horizon_client::mobs::render::abgr(rgb);
+            // A flying web zigzags: 16 bends, the swing widest mid-way.
+            let steps = if wave > 0.0 { 16 } else { 1 };
+            let point = |i: i32| {
+                let t = f64::from(i) / f64::from(steps);
+                let bend = if i % 2 == 0 { 1.0 } else { -1.0 };
+                let swing = if i == 0 || i == steps {
+                    0.0
+                } else {
+                    bend * f64::from(wave) * (t * std::f64::consts::PI).sin()
+                };
+                start + d * t + side * swing
+            };
+            for i in 0..steps {
+                let (a, b) = (point(i), point(i + 1));
+                let quad = [a - across, a + across, b + across, b - across];
+                for quad in [quad, [quad[3], quad[2], quad[1], quad[0]]] {
+                    for (v, uv) in quad.iter().zip(uv) {
+                        out.push(Vertex {
+                            normal: [0; 4],
+                            pos: (*v - camera).as_vec3().to_array(),
+                            uv,
+                            layer: 0,
+                            color,
+                            light: pack_light(0xF0 | 15),
+                            glint_uv: [0.0, 0.0],
+                        });
+                    }
+                }
+            }
+        }
+    }
     /// `Player.getRopeHoldPosition` (and `LocalPlayer`'s in first person).
     fn player_rope_hold(
         &self,

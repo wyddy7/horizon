@@ -46,11 +46,23 @@ pub use bindings::horizon::mods::{
     game::{Clock, Hit, Player},
     hud::{Corner, Line},
 };
+/// Capability `motion`'s imports: what a movement mod reads
+/// and the push, pose, ropes and camera it gives back.
+mod motion_bindings {
+    wasmtime::component::bindgen!({
+        path: "../horizon-mod-sdk/wit",
+        world: "motion-host",
+    });
+}
 use bindings::{
     HorizonMod,
     exports::horizon::mods::events::Registration,
     horizon::mods::{chat, command, game, hud, log as mod_log, storage},
 };
+pub use motion_bindings::horizon::mods::motion::{
+    Camera as ModCamera, PartPose, Ray as MotionRay, Rope, State as MotionState, Vec3 as MotionVec,
+};
+use motion_bindings::{MotionHost, horizon::mods::motion};
 pub use server_bindings::{
     exports::horizon::mods::server_events::{
         Argument, ArgumentKind, ArgumentValue, BlockPos, ServerCommand,
@@ -132,6 +144,18 @@ const STORAGE_MAX_KEYS: usize = 64;
 /// a cheap-in-fuel loop replacing one key with large payloads needs its own
 /// cap, separate from the on-disk quota it would otherwise stay under.
 const STORAGE_WRITE_BUDGET: u64 = 1 << 20;
+/// Capability `motion`: the fastest velocity a mod may set (blocks per
+/// tick) and how many ropes it may draw.
+const MOTION_MAX_SPEED: f64 = 5.0;
+const ROPES: usize = 4;
+/// Capability `motion`: the rays a mod may have cast every tick, and how
+/// far each may reach (blocks).
+pub const RAYS: usize = 128;
+pub const RAY_DISTANCE: f64 = 256.0;
+/// How far from the eyes or the feet a ray may start, on each axis.
+pub const RAY_OFFSET: f64 = 64.0;
+/// Past this a rope's end is outside any world (the border's reach).
+const WORLD_EDGE: f64 = 30_000_000.0;
 
 /// What mods may read of the game, copied once per tick by the game.
 #[derive(Clone, Debug, Default)]
@@ -167,6 +191,8 @@ pub struct Snapshot {
     pub placing: bool,
     /// The player is in creative mode (`recipes.give`).
     pub creative: bool,
+    /// Capability `motion`'s view; None unless a running mod declares it.
+    pub motion: Option<MotionState>,
 }
 
 /// Capability `recipes`'s tables: `items` in the registry's order, which
@@ -193,6 +219,14 @@ impl Runs {
             Runs::Server => side == Side::Server,
         }
     }
+}
+
+/// What `motion` mods asked of the player this tick, for the game to apply
+/// before the player moves.
+#[derive(Clone, Debug, Default)]
+pub struct MotionRequest {
+    pub velocity: Option<[f64; 3]>,
+    pub reset_fall: bool,
 }
 
 /// What mods asked the game to show since the last [`Mods::drain`].
@@ -425,6 +459,19 @@ struct State {
     /// not disk I/O time, so a loop of small-fuel, large-payload `set`s
     /// needs its own budget.
     storage_budget: u64,
+    /// Capability `motion`: this tick's request, and the ropes to draw.
+    motion: MotionRequest,
+    ropes: Vec<Rope>,
+    /// Capability `motion`: the player model's pose and flip.
+    pose: Option<(Vec<PartPose>, [f32; 3], Option<f32>, Option<[f32; 3]>)>,
+    /// Capability `motion`: the wind volume, if set this tick.
+    wind: Option<f32>,
+    /// Capability `motion`: the camera the mod asked for.
+    camera: Option<ModCamera>,
+    /// Capability `motion`: the rays the game casts every tick, and their
+    /// hits as of this tick.
+    rays: Vec<MotionRay>,
+    hits: Vec<Option<f64>>,
     limits: StoreLimits,
     world: WorldSlot,
 }
@@ -548,6 +595,8 @@ impl Mods {
                 .map_err(|e| e.to_string())?;
             RecipesHost::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s)
                 .map_err(|e| e.to_string())?;
+            MotionHost::add_to_linker::<State, HasSelf<State>>(&mut linker, |s| s)
+                .map_err(|e| e.to_string())?;
             self.engine = Some((engine, linker));
         }
         Ok(self.engine.as_ref().expect("made above"))
@@ -623,6 +672,13 @@ impl Mods {
             browser: BrowserState::default(),
             data_dir,
             storage_budget: STORAGE_WRITE_BUDGET,
+            motion: MotionRequest::default(),
+            ropes: Vec::new(),
+            pose: None,
+            wind: None,
+            camera: None,
+            rays: Vec::new(),
+            hits: Vec::new(),
             limits: StoreLimitsBuilder::new()
                 .memory_size(MEMORY)
                 .instances(16)
@@ -699,6 +755,73 @@ impl Mods {
     }
     pub fn entries(&self) -> &[Entry] {
         &self.entries
+    }
+    /// True when a running mod declares capability `motion`: the game
+    /// casts its rays only then.
+    pub fn wants_motion(&self) -> bool {
+        self.entries.iter().any(|e| {
+            e.run.is_some()
+                && e.manifest.as_ref().is_some_and(|m| {
+                    m.capabilities
+                        .contains(&crate::manifest::Capability::Motion)
+                })
+        })
+    }
+    /// The motion mods asked for since the last call, the last mod's
+    /// velocity winning.
+    pub fn take_motion(&mut self) -> MotionRequest {
+        let mut out = MotionRequest::default();
+        for run in self.entries.iter_mut().filter_map(|e| e.run.as_mut()) {
+            let r = std::mem::take(&mut run.store.data_mut().motion);
+            out.velocity = r.velocity.or(out.velocity);
+            out.reset_fall |= r.reset_fall;
+        }
+        out
+    }
+    /// Each running mod's rays (capability `motion`), by entry.
+    pub fn motion_rays(&self) -> Vec<(usize, Vec<MotionRay>)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| Some((i, e.run.as_ref()?.store.data().rays.clone())))
+            .filter(|(_, rays)| !rays.is_empty())
+            .collect()
+    }
+    /// Mod `i`'s ray hits for this tick, in its rays' order.
+    pub fn set_motion_hits(&mut self, i: usize, hits: Vec<Option<f64>>) {
+        if let Some(run) = self.entries.get_mut(i).and_then(|e| e.run.as_mut()) {
+            run.store.data_mut().hits = hits;
+        }
+    }
+    /// The loudest wind the running mods asked for this tick (each ask
+    /// lasts one tick).
+    pub fn wind(&mut self) -> Option<f32> {
+        self.entries
+            .iter_mut()
+            .filter_map(|e| e.run.as_mut())
+            .filter_map(|r| r.store.data_mut().wind.take())
+            .reduce(f32::max)
+    }
+    /// The first running mod's camera.
+    pub fn camera(&self) -> Option<ModCamera> {
+        self.entries
+            .iter()
+            .filter_map(|e| e.run.as_ref())
+            .find_map(|r| r.store.data().camera)
+    }
+    /// The first running mod's pose for the player's model.
+    pub fn pose(&self) -> Option<&(Vec<PartPose>, [f32; 3], Option<f32>, Option<[f32; 3]>)> {
+        self.entries
+            .iter()
+            .filter_map(|e| e.run.as_ref())
+            .find_map(|r| r.store.data().pose.as_ref())
+    }
+    /// Every running mod's ropes.
+    pub fn ropes(&self) -> impl Iterator<Item = &Rope> {
+        self.entries
+            .iter()
+            .filter_map(|e| e.run.as_ref())
+            .flat_map(|r| r.store.data().ropes.iter())
     }
     /// What mods read until the next snapshot.
     pub fn set_snapshot(&mut self, snapshot: Snapshot) {
@@ -1531,6 +1654,126 @@ impl State {
         }
     }
 }
+impl motion::Host for State {
+    fn get(&mut self) -> Option<MotionState> {
+        let mut state = self.snapshot.motion.clone()?;
+        state.hits = self.hits.clone();
+        Some(state)
+    }
+    fn set_rays(&mut self, rays: Vec<MotionRay>) {
+        self.rays = clean_rays(rays);
+    }
+    fn set_velocity(&mut self, v: MotionVec) {
+        if let Some(v) = clamp_velocity([v.x, v.y, v.z]) {
+            self.motion.velocity = Some(v);
+        }
+    }
+    fn reset_fall(&mut self) {
+        self.motion.reset_fall = true;
+    }
+    fn set_pose(
+        &mut self,
+        parts: Vec<PartPose>,
+        pitch: f32,
+        roll: f32,
+        twist: f32,
+        facing: Option<f32>,
+        shift: Option<MotionVec>,
+    ) {
+        let ok = |v: f32| v.is_finite();
+        let parts = parts
+            .into_iter()
+            .filter(|p| {
+                ok(p.pitch)
+                    && ok(p.yaw)
+                    && ok(p.roll)
+                    && p.pivot_y.is_none_or(ok)
+                    && p.pivot_z.is_none_or(ok)
+            })
+            .take(8)
+            .collect();
+        let angle = |v: f32| if v.is_finite() { v } else { 0.0 };
+        let shift = shift.map(|v| {
+            [v.x, v.y, v.z].map(|c| {
+                if c.is_finite() {
+                    c.clamp(-2.0, 2.0) as f32
+                } else {
+                    0.0
+                }
+            })
+        });
+        self.pose = Some((
+            parts,
+            [angle(pitch), angle(roll), angle(twist)],
+            facing.filter(|f| f.is_finite()),
+            shift,
+        ));
+    }
+    fn set_wind(&mut self, volume: f32) {
+        if volume.is_finite() {
+            self.wind = Some(volume.clamp(0.0, 0.5));
+        }
+    }
+    fn set_camera(&mut self, camera: Option<ModCamera>) {
+        let ok = |v: &MotionVec| [v.x, v.y, v.z].iter().all(|c| c.is_finite());
+        self.camera = match camera {
+            Some(ModCamera::Chase(c))
+                if c.distance.is_finite() && c.height.is_finite() && c.side.is_finite() =>
+            {
+                Some(ModCamera::Chase(motion::ChaseCamera {
+                    distance: c.distance.clamp(0.0, 32.0),
+                    height: c.height.clamp(-8.0, 8.0),
+                    side: c.side.clamp(-8.0, 8.0),
+                    wall: c
+                        .wall
+                        .filter(|w| [w.x, w.y, w.z].iter().all(|v| v.is_finite())),
+                    wall_blend: if c.wall_blend.is_finite() {
+                        c.wall_blend.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    },
+                }))
+            }
+            Some(ModCamera::Fixed(f)) if ok(&f.at) && ok(&f.look_at) => Some(ModCamera::Fixed(f)),
+            _ => None,
+        };
+    }
+    fn clear_pose(&mut self) {
+        self.pose = None;
+    }
+    fn set_ropes(&mut self, ropes: Vec<Rope>) {
+        self.ropes = ropes
+            .into_iter()
+            .filter(|r| {
+                [r.to.x, r.to.y, r.to.z]
+                    .iter()
+                    .all(|c| c.is_finite() && c.abs() < WORLD_EDGE)
+            })
+            .filter(|r| {
+                r.from.as_ref().is_none_or(|f| {
+                    [f.x, f.y, f.z]
+                        .iter()
+                        .all(|c| c.is_finite() && c.abs() < 4.0)
+                })
+            })
+            .take(ROPES)
+            .map(|r| Rope {
+                color: r.color & 0xFF_FFFF,
+                progress: if r.progress.is_finite() {
+                    r.progress.clamp(0.0, 1.0)
+                } else {
+                    1.0
+                },
+                wave: if r.wave.is_finite() {
+                    r.wave.clamp(0.0, 2.0)
+                } else {
+                    0.0
+                },
+                ..r
+            })
+            .collect();
+    }
+}
 impl State {
     /// Queues a chat line unless the call already sent [`CHAT_PER_CALL`].
     fn say(&mut self, line: impl FnOnce(String) -> Output) -> bool {
@@ -1976,4 +2219,103 @@ fn storage_key_ok(key: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(&b));
     chars_ok && key != "." && key != ".."
+}
+
+/// `motion.set-rays`' list as the game casts it: at most [`RAYS`], each kept
+/// in its place (a mod reads the hits by position) with its offset and
+/// distance clamped; a ray with a non-finite part finds nothing.
+fn clean_rays(rays: Vec<MotionRay>) -> Vec<MotionRay> {
+    let ok = |v: &MotionVec| [v.x, v.y, v.z].iter().all(|c| c.is_finite());
+    let zero = MotionVec {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    };
+    rays.into_iter()
+        .take(RAYS)
+        .map(|r| {
+            if !(ok(&r.offset) && ok(&r.dir) && r.distance.is_finite()) {
+                return MotionRay {
+                    offset: zero,
+                    dir: zero,
+                    distance: 0.0,
+                    ..r
+                };
+            }
+            MotionRay {
+                offset: MotionVec {
+                    x: r.offset.x.clamp(-RAY_OFFSET, RAY_OFFSET),
+                    y: r.offset.y.clamp(-RAY_OFFSET, RAY_OFFSET),
+                    z: r.offset.z.clamp(-RAY_OFFSET, RAY_OFFSET),
+                },
+                distance: r.distance.clamp(0.0, RAY_DISTANCE),
+                ..r
+            }
+        })
+        .collect()
+}
+
+/// `motion.set-velocity`'s velocity, at most [`MOTION_MAX_SPEED`] long;
+/// none when a part is not finite.
+fn clamp_velocity(v: [f64; 3]) -> Option<[f64; 3]> {
+    if v.iter().any(|c| !c.is_finite()) {
+        return None;
+    }
+    let len = v.iter().map(|c| c * c).sum::<f64>().sqrt();
+    let k = if len > MOTION_MAX_SPEED {
+        MOTION_MAX_SPEED / len
+    } else {
+        1.0
+    };
+    Some(v.map(|c| c * k))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ray(offset: [f64; 3], distance: f64) -> MotionRay {
+        MotionRay {
+            from_eyes: true,
+            offset: MotionVec {
+                x: offset[0],
+                y: offset[1],
+                z: offset[2],
+            },
+            dir: MotionVec {
+                x: 0.0,
+                y: -1.0,
+                z: 0.0,
+            },
+            distance,
+            solid: false,
+        }
+    }
+
+    #[test]
+    fn velocity_is_capped_and_non_finite_dropped() {
+        assert_eq!(clamp_velocity([1.0, 2.0, 0.0]), Some([1.0, 2.0, 0.0]));
+        let v = clamp_velocity([30.0, 40.0, 0.0]).unwrap();
+        assert!((v[0] - 3.0).abs() < 1e-9 && (v[1] - 4.0).abs() < 1e-9);
+        assert_eq!(clamp_velocity([f64::NAN, 0.0, 0.0]), None);
+        assert_eq!(clamp_velocity([f64::INFINITY, 0.0, 0.0]), None);
+    }
+
+    #[test]
+    fn rays_are_capped_clamped_and_keep_their_places() {
+        let rays = vec![
+            ray([0.0, 500.0, 0.0], 1e9),
+            ray([f64::NAN, 0.0, 0.0], 5.0),
+            ray([1.0, 2.0, 3.0], 10.0),
+        ];
+        let out = clean_rays(rays);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].offset.y, RAY_OFFSET);
+        assert_eq!(out[0].distance, RAY_DISTANCE);
+        // The broken ray stays in place and finds nothing.
+        assert_eq!(out[1].distance, 0.0);
+        assert_eq!(out[1].dir.y, 0.0);
+        assert_eq!(out[2].offset.z, 3.0);
+        assert_eq!(clean_rays(vec![ray([0.0; 3], 1.0); RAYS + 10]).len(), RAYS);
+    }
 }

@@ -431,6 +431,132 @@ interface render {
     set-far-terrain: func(far-terrain: option<far-terrain>);
 }
 
+/// Capability `motion` (experimental: the manifest needs
+/// `experimental = ["motion"]`): what a movement mod (grappling hooks, web
+/// swinging, wall running) reads and the push it gives back. Its keys come
+/// from `input`, a camera shake from `render`.
+///
+/// It acts only in the player's own world (single player, or a LAN world
+/// they host): on another server `get` is none and the rest do nothing.
+/// Read once per tick like `game`; what a mod sets in `tick` applies to the
+/// player's next move.
+interface motion {
+    record vec3 {
+        x: f64,
+        y: f64,
+        z: f64,
+    }
+    /// A ray the game casts for the mod at the start of every tick, from
+    /// where the player then is (see `set-rays`).
+    record ray {
+        /// From the eyes, else from the feet; then moved by `offset`
+        /// (blocks, at most 64 on each axis).
+        from-eyes: bool,
+        offset: vec3,
+        /// Unit direction.
+        dir: vec3,
+        /// Blocks, at most 256.
+        distance: f64,
+        /// Against collision boxes (what can be stood on and run into:
+        /// grass and flowers pass), else against outlines (what the
+        /// crosshair picks). Fluids pass either way.
+        solid: bool,
+    }
+    record state {
+        /// Blocks per tick.
+        velocity: vec3,
+        on-ground: bool,
+        eye: vec3,
+        /// Unit view vector (turned with the wall camera's view, so a ray
+        /// along it stays under the crosshair).
+        look: vec3,
+        /// For each ray of the last `set-rays`, in order: how far along it
+        /// the first box is, cast at the start of this tick; none past its
+        /// distance. Empty before the first `set-rays`.
+        hits: list<option<f64>>,
+    }
+    /// A line from the player's hand to `to`, drawn every frame until the
+    /// mod sets other ropes.
+    record rope {
+        to: vec3,
+        /// 0xRRGGBB.
+        color: u32,
+        /// How much of the way to `to` is drawn, 0..1 (a web still flying).
+        progress: f32,
+        /// Zigzag amplitude in blocks across the line (0: straight).
+        wave: f32,
+        /// Where the line starts, from the player's feet (as drawn, between
+        /// ticks); none for the vanilla hand.
+        %from: option<vec3>,
+    }
+    /// None on the title screen and on another server.
+    get: func() -> option<state>;
+    /// Replaces the player's velocity for its next move; clipped to 5 blocks
+    /// per tick.
+    set-velocity: func(v: vec3);
+    /// Forgets the fall so far, for this tick: the world's server hears the
+    /// player as on the ground. Call it every tick a fall should not count;
+    /// called once mid-fall, the fall up to then lands as damage.
+    reset-fall: func();
+    /// At most 4 ropes.
+    set-ropes: func(ropes: list<rope>);
+    /// The rays to cast every tick until set again, at most 128: their
+    /// hits come back in `state.hits` from the next tick on.
+    set-rays: func(rays: list<ray>);
+
+    /// One part of the player's model (`head`, `body`, `right_arm`,
+    /// `left_arm`, `right_leg`, `left_leg`): rotations in radians as
+    /// `ModelPart` xRot, yRot and zRot, and optionally its pivot's y and z.
+    record part-pose {
+        part: string,
+        pitch: f32,
+        yaw: f32,
+        roll: f32,
+        pivot-y: option<f32>,
+        pivot-z: option<f32>,
+    }
+    /// Poses the player's own model (seen in third person) over the vanilla
+    /// animation until cleared; `pitch` (forward is negative) and then `roll`
+    /// (radians) turn the whole body about its middle. Set once per tick;
+    /// the game blends between ticks.
+    /// `facing`: the body's yaw in degrees as F3 shows it (none: the view's).
+    /// `shift`: the whole body moved this far in the world (blocks, at most 2).
+    /// `twist`: then a turn about the body's own up axis (radians).
+    set-pose: func(parts: list<part-pose>, pitch: f32, roll: f32, twist: f32, facing: option<f32>, shift: option<vec3>);
+    /// Wind heard while moving, 0..0.5 of the elytra loop's volume, until
+    /// set again; the game stops it when the mod stops setting it.
+    set-wind: func(volume: f32);
+
+    /// Behind the player along the view, `distance` back, `height` above the
+    /// eyes and `side` to the right (blocks); pulled in by walls, and moved
+    /// to the side with more room when a wall is close behind.
+    record chase-camera {
+        distance: f32,
+        height: f32,
+        side: f32,
+        /// The wall-as-floor view (Web of Shadows): the unit direction
+        /// toward the wall the player runs on, and how far the camera has
+        /// turned into it, 0 (the chase camera) to 1 (rolled 90 degrees,
+        /// the wall below, looking up it).
+        wall: option<vec3>,
+        wall-blend: f32,
+    }
+    /// A camera standing at `at`, looking at `look-at` (the player's model
+    /// is drawn): for checking poses from a fixed side.
+    record fixed-camera {
+        at: vec3,
+        look-at: vec3,
+    }
+    variant camera {
+        chase(chase-camera),
+        fixed(fixed-camera),
+    }
+    /// The third-person camera until set again; none gives the game's own.
+    set-camera: func(camera: option<camera>);
+    /// Gives the player's model back to the game's own animation.
+    clear-pose: func();
+}
+
 /// What the game calls. Only the hooks `init` asks for are ever called.
 interface events {
     record registration {
@@ -815,6 +941,7 @@ world horizon-ui-mod {
     import input;
     import recipes;
     import browser;
+    import motion;
     export ui-events;
 }
 
@@ -834,4 +961,9 @@ world render-host {
 world recipes-host {
     import recipes;
     import browser;
+}
+
+/// The game's side of capability `motion` (imports only).
+world motion-host {
+    import motion;
 }
